@@ -1,6 +1,7 @@
 import re
 import os
 
+import threading
 import time
 
 import redshift_connector
@@ -480,6 +481,10 @@ class RedshiftConnectionManager(SQLConnectionManager):
         # Callable that returns whether to skip transaction statements
         # Set by the adapter after initialization via set_skip_transactions_checker
         self._skip_transactions_checker: Optional[Callable[[], bool]] = None
+        # Per-thread log of statements executed since the last begin/commit,
+        # so a retry after a connection reset can rebuild the transaction
+        # instead of only resending the one statement that failed.
+        self._statement_log: Dict[int, List[Tuple[str, bool]]] = {}
 
     def set_skip_transactions_checker(self, checker: Callable[[], bool]) -> None:
         """Set the checker function that determines if transaction statements should be skipped.
@@ -541,6 +546,35 @@ class RedshiftConnectionManager(SQLConnectionManager):
         connection = self.get_thread_connection()
         return connection.credentials.autocommit is True
 
+    def _clear_statement_log(self) -> None:
+        self._statement_log.pop(threading.get_ident(), None)
+
+    def _record_statement(self, sql: str, auto_begin: bool) -> None:
+        self._statement_log.setdefault(threading.get_ident(), []).append((sql, auto_begin))
+
+    def _replay_statement_log(self) -> None:
+        """Re-run every statement recorded since the last begin/commit.
+
+        Called after a retryable error closes and reopens the connection.
+        The reopened connection has none of the current transaction's
+        uncommitted work, so anything issued earlier in that transaction has
+        to be replayed before the statement that originally failed is
+        retried - otherwise later statements can fail against state (e.g. a
+        table from an earlier CREATE) that no longer exists.
+
+        Note this replays each statement's SQL text, not its original
+        result - a statement whose output fed a decision already made in
+        Python won't redo that decision, and IDENTITY/sequence values are not
+        transactional in Redshift, so replayed inserts using them may not
+        get the same values as the first, rolled-back attempt.
+        """
+        log = self._statement_log.get(threading.get_ident(), [])
+        if not log:
+            return
+        logger.debug(f"Replaying {len(log)} statement(s) after connection reset")
+        for sql, auto_begin in log:
+            self.add_query(sql, auto_begin)
+
     def begin(self) -> None:
         """Begin a transaction.
 
@@ -556,6 +590,7 @@ class RedshiftConnectionManager(SQLConnectionManager):
             super().begin()
 
         connection.transaction_open = True
+        self._clear_statement_log()
 
     def commit(self) -> None:
         """Commit the current transaction.
@@ -571,6 +606,7 @@ class RedshiftConnectionManager(SQLConnectionManager):
             # Only skip COMMIT if autocommit + behavior flag is set
             super().commit()
         connection.transaction_open = False
+        self._clear_statement_log()
 
     def rollback_if_open(self) -> None:
         """Rollback the current transaction if one is open.
@@ -586,6 +622,7 @@ class RedshiftConnectionManager(SQLConnectionManager):
             # Only perform ROLLBACK if autocommit + behavior flag is not set
             super().rollback_if_open()
         connection.transaction_open = False
+        self._clear_statement_log()
 
     @contextmanager
     def exception_handler(self, sql):
@@ -717,6 +754,9 @@ class RedshiftConnectionManager(SQLConnectionManager):
             # otherwise no queries will succeed on this connection
             self.close(self.get_thread_connection())
             self.open(self.get_thread_connection())
+            # the reopened connection lost whatever this transaction had done
+            # before the failing statement; rebuild that state before retrying it
+            self._replay_statement_log()
             time.sleep(backoff)
             # return with exponential backoff
             return retries, min(max(backoff * 2, 2), 60)
@@ -739,6 +779,7 @@ class RedshiftConnectionManager(SQLConnectionManager):
                     from dbt_common.clients import agate_helper
 
                     internal_table = agate_helper.empty_table()
+                self._record_statement(sql, auto_begin)
                 return internal_response, internal_table
             except Exception as e:
                 retries, backoff = _handle_execute_exception(e, retries, backoff, retry_all)

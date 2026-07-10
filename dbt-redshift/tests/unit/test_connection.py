@@ -1,3 +1,4 @@
+from contextlib import ExitStack
 from multiprocessing import get_context
 from unittest import TestCase, mock
 
@@ -701,3 +702,121 @@ class TestExecuteRetryTransientErrors(TestCase):
             "could not complete because of conflict with concurrent transaction",
             always_fail=True,
         )
+
+
+class TestStatementReplayOnRetry(TestCase):
+    """A retry that only resends the one failed statement can leave a
+    transaction half-rebuilt: anything issued earlier in that transaction was
+    discarded when the connection was reset, but isn't reissued. These tests
+    cover the fix - replaying every statement recorded since the last
+    begin/commit before retrying the one that failed.
+    """
+
+    def setUp(self):
+        profile_cfg = {
+            "outputs": {
+                "test": {
+                    "type": "redshift",
+                    "dbname": "redshift",
+                    "user": "root",
+                    "host": "thishostshouldnotexist.test.us-east-1",
+                    "pass": "password",
+                    "port": 5439,
+                    "schema": "public",
+                    "retries": 2,
+                }
+            },
+            "target": "test",
+        }
+        project_cfg = {
+            "name": "X",
+            "version": "0.1",
+            "profile": "test",
+            "project-root": "/tmp/dbt/does-not-exist",
+            "quoting": {"identifier": False, "schema": True},
+            "config-version": 2,
+        }
+        config = config_from_parts_or_dicts(project_cfg, profile_cfg)
+        self.adapter = RedshiftAdapter(config, get_context("spawn"))
+        inject_adapter(self.adapter, RedshiftPlugin)
+        self.mgr = self.adapter.connections
+
+    def _patch_stack(self, stack, add_query_side_effect):
+        conn = mock_connection("test_conn")
+        stack.enter_context(
+            mock.patch.object(self.mgr, "add_query", side_effect=add_query_side_effect)
+        )
+        stack.enter_context(mock.patch.object(self.mgr, "get_response", return_value=MagicMock()))
+        stack.enter_context(mock.patch.object(self.mgr, "close"))
+        stack.enter_context(mock.patch.object(self.mgr, "open"))
+        stack.enter_context(
+            mock.patch.object(self.mgr, "get_thread_connection", return_value=conn)
+        )
+        stack.enter_context(mock.patch.object(self.mgr, "get_if_exists", return_value=conn))
+        stack.enter_context(mock.patch("time.sleep"))
+
+    def test_replays_prior_statements_before_retrying_failed_one(self):
+        calls = []
+        cursor_mock = MagicMock()
+        cursor_mock.description = [["id"]]
+
+        def fake_add_query(sql, auto_begin=True):
+            calls.append(sql)
+            # the rename fails exactly once, on its first attempt
+            if sql == "rename intermediate to target" and calls.count(sql) == 1:
+                raise DbtDatabaseError("conflict with concurrent transaction")
+            return None, cursor_mock
+
+        with ExitStack() as stack:
+            self._patch_stack(stack, fake_add_query)
+            self.mgr.execute("create intermediate")
+            self.mgr.execute("rename intermediate to target")
+
+        # the create should be replayed once (to rebuild the reset connection's
+        # state) before the rename is retried and succeeds
+        assert calls == [
+            "create intermediate",
+            "rename intermediate to target",
+            "create intermediate",
+            "rename intermediate to target",
+        ]
+
+    def test_commit_clears_the_replay_log(self):
+        calls = []
+        cursor_mock = MagicMock()
+        cursor_mock.description = [["id"]]
+
+        def fake_add_query(sql, auto_begin=True):
+            calls.append(sql)
+            if sql == "second statement" and calls.count(sql) == 1:
+                raise DbtDatabaseError("conflict with concurrent transaction")
+            return None, cursor_mock
+
+        with ExitStack() as stack:
+            self._patch_stack(stack, fake_add_query)
+            self.mgr.execute("first statement")
+            self.mgr.commit()
+            self.mgr.execute("second statement")
+
+        # "first statement" was committed, so it must not be replayed when
+        # "second statement" fails and retries
+        assert calls == ["first statement", "COMMIT", "second statement", "second statement"]
+
+    def test_rollback_clears_the_replay_log(self):
+        calls = []
+        cursor_mock = MagicMock()
+        cursor_mock.description = [["id"]]
+
+        def fake_add_query(sql, auto_begin=True):
+            calls.append(sql)
+            if sql == "second statement" and calls.count(sql) == 1:
+                raise DbtDatabaseError("conflict with concurrent transaction")
+            return None, cursor_mock
+
+        with ExitStack() as stack:
+            self._patch_stack(stack, fake_add_query)
+            self.mgr.execute("first statement")
+            self.mgr.rollback_if_open()
+            self.mgr.execute("second statement")
+
+        assert calls == ["first statement", "second statement", "second statement"]
